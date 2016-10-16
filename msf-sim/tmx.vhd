@@ -16,7 +16,6 @@ package tmx is
       pirq     : integer                    := 0;          -- interrupt index
       sbits    : integer range 12 to 32     := 20;
       divisor  : integer range 0 to 1048575 := 632911;
-      fifosize : integer range 0 to 7       := 1;
       clk_freq : positive                   := 50000000);  -- clock frequency in Hz
 
     port (

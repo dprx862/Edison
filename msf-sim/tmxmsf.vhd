@@ -46,7 +46,6 @@ entity tmxmsf is
     pirq     : integer                    := 0;          -- interrupt index
     sbits    : integer range 12 to 32     := 20;
     divisor  : integer range 0 to 1048575 := 632911;
-    fifosize : integer range 0 to 7       := 1;
     clk_freq : positive                   := 50000000);  -- clock frequency in Hz
 
   port (
@@ -87,14 +86,16 @@ architecture rtl of tmxmsf is
   constant PARITY_OK : std_logic_vector(3 downto 0) := "1111";
   constant MARKER_OK : std_logic_vector(7 downto 0) := "01111110";
 
+  constant MSF_MINUTE : std_logic_vector(7 downto 0) := "11110000";
+  constant MSF_A      : std_logic_vector(7 downto 0) := "11111110";
+  constant MSF_B      : std_logic_vector(7 downto 0) := "11111101";
+  constant MSF_AB     : std_logic_vector(7 downto 0) := "11111100";
+  constant MSF_SECOND : std_logic_vector(7 downto 0) := "11111111";
+
+
   constant sbitszero : std_logic_vector(sbits-1 downto 0) := (others => '0');
 
-  type rxfsmtype is (idle, startbit, data, stopbit);
-  type fifo is array (0 to fifosize - 1) of std_logic_vector(7 downto 0);
-
-  constant fifozero : fifo                                       := (others => (others => '0'));
-  constant rcntzero : std_logic_vector(log2x(fifosize) downto 0) := (others => '0');
-
+  type rxfsmtype is (idle, startbit, data, stopbit, update);
 
   -----------------------------------------------------------------------------
   -- Functions
@@ -165,15 +166,10 @@ architecture rtl of tmxmsf is
     brate      : std_logic_vector(sbits-1 downto 0);
     rxf        : std_logic_vector(4 downto 0);  --  rx data filtering buffer
     rsempty    : std_ulogic;  -- receiver shift register empty (internal)
-    rhold      : fifo;
+    rhold      : std_logic_vector(7 downto 0);
     rshift     : std_logic_vector(7 downto 0);
-    rwaddr     : std_logic_vector(log2x(fifosize) - 1 downto 0);
-    rcnt       : std_logic_vector(log2x(fifosize) downto 0);
     break      : std_ulogic;            -- break detected
-    ovf        : std_ulogic;            -- receiver overflow
-    parerr     : std_ulogic;            -- parity error
     frame      : std_ulogic;            -- framing error
-    dpar       : std_ulogic;            -- rx data parity (internal)
 
   end record;
 
@@ -190,11 +186,6 @@ begin
     variable scaler  : std_logic_vector(sbits-1 downto 0) := (others => '0');
     variable rxd     : std_ulogic                         := '0';
 
-    variable rhalffull : std_ulogic;
-    variable rfull     : std_ulogic;
-    variable tfull     : std_ulogic;
-    variable dready    : std_ulogic;
-
   begin
 
     v       := r;
@@ -204,9 +195,7 @@ begin
     v.rxtick  := '0';
     v.tick    := '0';
     v.rxdb(1) := r.rxdb(0);
-    dready    := '0';
-    rhalffull := '0';
-
+    v.second  := false;
 
     -- scaler
     scaler := r.scaler - 1;
@@ -230,31 +219,35 @@ begin
     if r.tick = '1' then
       v.rxf(4 downto 2) := r.rxf(3 downto 1);
     end if;
+
     v.rxdb(0) := (r.rxf(4) and r.rxf(3)) or (r.rxf(4) and r.rxf(2)) or
                  (r.rxf(3) and r.rxf(2));
 
     rxd := r.rxdb(0);
-
 
     -- receiver operation
 
     case r.rxstate is
 
       when idle =>                      -- wait for start bit
-        if ((r.rsempty = '0') and not (rfull = '1')) then
-          v.rsempty                       := '1';
-          v.rhold(conv_integer(r.rwaddr)) := r.rshift;
-          v.rcnt(0)                       := '1';
+        if (r.rsempty = '0') then
+          v.rsempty := '1';
+          v.rhold   := r.rshift;
         end if;
         if (r.ctrl_r.en and r.rxdb(1) and (not rxd)) = '1' then
-          v.rxstate := startbit;
-          v.rshift  := (others => '1');
-          v.rxclk   := "100";
-          if v.rsempty = '0' then
-            v.ovf := '1';
-          end if;
-          v.rsempty := '0';
-          v.rxtick  := '0';
+          v.rxstate   := startbit;
+          v.second    := true;
+          v.parity(3) := xor_bits(unsigned (r.abits(17 to 24) & r.bbits(54)));
+          v.parity(2) := xor_bits(unsigned (r.abits(25 to 35) & r.bbits(55)));
+          v.parity(1) := xor_bits(unsigned (r.abits(36 to 38) & r.bbits(56)));
+          v.parity(0) := xor_bits(unsigned (r.abits(39 to 51) & r.bbits(57)));
+          v.marker    := r.abits(52 to 59);
+          v.rshift    := (others => '1');
+          v.rxclk     := "100";
+          v.rsempty   := '0';
+          v.rxtick    := '0';
+          v.frame     := '0';
+          v.break     := '0';
         end if;
       when startbit =>                  -- check validity of start bit
         if r.rxtick = '1' then
@@ -263,6 +256,41 @@ begin
             v.rxstate := data;
           else
             v.rxstate := idle;
+          end if;
+        end if;
+
+        if (r.valid_bits = 60) then
+          v.minute    := true;
+          v.time_r.ss := (others => '0');
+
+          if (r.second = true) then
+            if (r.parity = PARITY_OK) and (r.marker = MARKER_OK) then
+              -- We got a valid frame, update our registers
+              v.date_r.yyv     := r.abits(17 to 24);
+              v.date_r.mm      := "000" & r.abits(25 to 29);
+              v.date_r.dd      := "00" & r.abits(30 to 35);
+              v.time_r.hh      := "00" & r.abits(39 to 44);
+              v.time_r.mm      := "0" & r.abits(45 to 51);
+              v.time_r.bstpend := r.bbits(53);
+              v.time_r.bstact  := r.bbits(58);
+              v.misc_r.dow     := "0" & r.abits(36 to 38);
+              v.stat_r.valid   := '1';
+              v.parity         := not PARITY_OK;
+              v.marker         := not MARKER_OK;
+            end if;
+          end if;
+        else
+          if (r.second = true) then
+            if r.time_r.ss(7 downto 4) = "0110" then
+              v.time_r.ss := (others => '0');
+            else
+              if r.time_r.ss(3 downto 0) = "1001" then
+                v.time_r.ss(3 downto 0) := (others => '0');
+                v.time_r.ss(7 downto 4) := std_logic_vector(unsigned(r.time_r.ss(7 downto 4)) + 1);
+              else
+                v.time_r.ss(3 downto 0) := std_logic_vector(unsigned(r.time_r.ss(3 downto 0)) + 1);
+              end if;
+            end if;
           end if;
         end if;
 
@@ -277,18 +305,9 @@ begin
       when stopbit =>                   -- receive stop bit
         if r.rxtick = '1' then
           if rxd = '1' then
-            v.parerr  := r.parerr or r.dpar;
-            v.rsempty := r.dpar;
-            if not (rfull = '1') and (r.dpar = '0') then
-              v.rsempty                       := '1';
-              v.rhold(conv_integer(r.rwaddr)) := r.rshift;
-              if fifosize = 1 then
-                v.rcnt(0) := '1';
-              else
-                v.rwaddr := r.rwaddr + 1;
-                v.rcnt   := v.rcnt + 1;
-              end if;
-            end if;
+            v.rsempty := '1';
+            v.rhold   := r.rshift;
+            v.rxstate := update;
           else
             if r.rshift = "00000000" then
               v.break := '1';
@@ -296,9 +315,29 @@ begin
               v.frame := '1';
             end if;
             v.rsempty := '1';
+            v.rxstate := idle;
           end if;
-          v.rxstate := idle;
         end if;
+
+      when update =>                    -- update registers
+        case r.rhold is
+          when MSF_MINUTE =>
+            v.valid_bits := 1;
+            v.abits      := (others => '0');
+            v.bbits      := (others => '0');
+
+          when MSF_A | MSF_B | MSF_AB | MSF_SECOND =>
+            v.abits(r.valid_bits) := not r.rhold(0);
+            v.bbits(r.valid_bits) := not r.rhold(1);
+            v.valid_bits          := r.valid_bits + 1;
+
+          when others =>
+            v.valid_bits := 1;
+            v.time_r.ss  := (others => '0');
+        end case;
+
+        v.rxstate := idle;
+
     end case;
 
     -- read registers
@@ -362,8 +401,8 @@ begin
       v.misc_r.dow     := (others => '0');
       v.abits          := (others => '0');
       v.bbits          := (others => '0');
-      v.parity         := (others => '0');
-      v.marker         := (others => '0');
+      v.parity         := not PARITY_OK;
+      v.marker         := not MARKER_OK;
 
       v.rxstate := idle;
       v.rxclk   := (others => '0');
@@ -374,16 +413,10 @@ begin
       v.brate   := std_logic_vector(to_unsigned(divisor, v.scaler'length));
       v.rxf     := (others => '0');
       v.rsempty := '1';
-      v.rhold   := fifozero;
+      v.rhold   := (others => '0');
       v.rshift  := (others => '0');
-      v.rwaddr  := (others => '0');
-      v.rcnt    := rcntzero;
-
-      v.break  := '0';
-      v.ovf    := '0';
-      v.parerr := '0';
-      v.frame  := '0';
-      v.dpar   := '0';
+      v.break   := '0';
+      v.frame   := '0';
     end if;
 
     -- Update registers
@@ -414,28 +447,4 @@ begin
 
 end architecture rtl;
 
-
-
-
-
---        v.parity(3) := xor_bits(unsigned (r.abits(17 to 24) & r.bbits(54)));
---        v.parity(2) := xor_bits(unsigned (r.abits(25 to 35) & r.bbits(55)));
---        v.parity(1) := xor_bits(unsigned (r.abits(36 to 38) & r.bbits(56)));
---        v.parity(0) := xor_bits(unsigned (r.abits(39 to 51) & r.bbits(57)));
---        v.marker    := r.abits(52 to 59);
---            if (r.parity = PARITY_OK) and (r.marker = MARKER_OK) then
---
---              -- We got a valid frame, update our registers
---              v.date_r.yyv     := r.abits(17 to 24);
---              v.date_r.mm      := "000" & r.abits(25 to 29);
---              v.date_r.dd      := "00" & r.abits(30 to 35);
---              v.time_r.hh      := "00" & r.abits(39 to 44);
---              v.time_r.mm      := "0" & r.abits(45 to 51);
---              v.time_r.ss      := (others => '0');
---              v.time_r.bstpend := r.bbits(53);
---              v.time_r.bstact  := r.bbits(58);
---              v.misc_r.dow     := "0" & r.abits(36 to 38);
---              v.stat_r.valid   := '1';
---
---          end if;
 
